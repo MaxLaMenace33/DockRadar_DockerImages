@@ -110,7 +110,14 @@ jobs:
         run: |
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$RUNNER_TEMP:/out" "$TRIVY_IMAGE" \
             image --quiet --pkg-types os --ignore-unfixed --format json --output /out/before.json "$IMAGE"
-          echo "BEFORE=$(jq '[.Results[]?.Vulnerabilities[]?] | length' "$RUNNER_TEMP/before.json")" >> "$GITHUB_ENV"
+          before=$(jq '[.Results[]?.Vulnerabilities[]?] | length' "$RUNNER_TEMP/before.json")
+          echo "BEFORE=$before" >> "$GITHUB_ENV"
+          # The tag moved on since the server pulled it: nothing left to patch.
+          if [ "$before" = 0 ]; then
+            echo "The current $IMAGE has no fixable OS vulnerability: pull it again (docker compose pull) and recreate the container" \
+              > "$RUNNER_TEMP/error.txt"
+            exit 1
+          fi
 
       - name: Install Copacetic
         run: |
@@ -133,11 +140,14 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          # Without a report, Copacetic upgrades every package of the image's
-          # package manager (apt, apk, dnf/yum, tdnf) to its latest version.
-          platform_flag=""
-          [ "$PLATFORM" = linux/amd64 ] || platform_flag="--platform $PLATFORM"
-          if ! "$RUNNER_TEMP/copa" patch --image "$IMAGE" --tag dockradar-patched $platform_flag \
+          # amd64: patch the packages Trivy flagged (single platform). Other
+          # platforms: upgrade every package of that platform only.
+          if [ "$PLATFORM" = linux/amd64 ]; then
+            mode="--report $RUNNER_TEMP/before.json"
+          else
+            mode="--platform $PLATFORM"
+          fi
+          if ! "$RUNNER_TEMP/copa" patch --image "$IMAGE" --tag dockradar-patched $mode --loader docker \
             --addr tcp://127.0.0.1:8888 --timeout 30m 2>&1 | tee "$RUNNER_TEMP/copa.log"; then
             reason=$(grep -iE 'error|unsupported|no package manager' "$RUNNER_TEMP/copa.log" | tail -1 | cut -c1-300)
             echo "Copacetic could not patch this image${reason:+: $reason}" > "$RUNNER_TEMP/error.txt"
