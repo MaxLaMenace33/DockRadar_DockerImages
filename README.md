@@ -16,6 +16,9 @@ image (Java, npm, pip...) are not changed.
 | `ghcr.io/org/app:1` | `dockradar/ghcr-io-org-app:1` |
 
 Every build also gets a dated tag (`latest-20261030`) that never moves.
+DockRadar checks the original tags every few hours and rebuilds a fixed image
+as soon as its original is republished, so `dockradar/<image>:<tag>` follows
+upstream. When the original already ships every OS fix, it is published as is.
 
 ## How it works
 

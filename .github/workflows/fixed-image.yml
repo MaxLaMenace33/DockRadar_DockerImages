@@ -112,20 +112,19 @@ jobs:
             image --quiet --pkg-types os --ignore-unfixed --format json --output /out/before.json "$IMAGE"
           before=$(jq '[.Results[]?.Vulnerabilities[]?] | length' "$RUNNER_TEMP/before.json")
           echo "BEFORE=$before" >> "$GITHUB_ENV"
-          # The tag moved on since the server pulled it: nothing left to patch.
-          if [ "$before" = 0 ]; then
-            echo "The current $IMAGE has no fixable OS vulnerability: pull it again (docker compose pull) and recreate the container" \
-              > "$RUNNER_TEMP/error.txt"
-            exit 1
-          fi
+          # Upstream already ships every OS fix: the fixed image is the
+          # original one, published as is so it keeps following its tag.
+          [ "$before" = 0 ] && echo "CLEAN=true" >> "$GITHUB_ENV" || echo "CLEAN=false" >> "$GITHUB_ENV"
 
       - name: Install Copacetic
+        if: env.CLEAN != 'true'
         run: |
           curl -fsSL "https://github.com/project-copacetic/copacetic/releases/download/v${COPA_VERSION}/copa_${COPA_VERSION}_linux_amd64.tar.gz" \
             | tar -xz -C "$RUNNER_TEMP" copa
           "$RUNNER_TEMP/copa" --version
 
       - name: Start BuildKit
+        if: env.CLEAN != 'true'
         run: |
           docker run --detach --rm --privileged -p 127.0.0.1:8888:8888/tcp --name buildkitd \
             --entrypoint buildkitd "$BUILDKIT_IMAGE" --addr tcp://0.0.0.0:8888
@@ -140,6 +139,11 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
+          if [ "$CLEAN" = true ]; then
+            docker tag "$IMAGE" "$TARGET"
+            docker tag "$IMAGE" "$DATED"
+            exit 0
+          fi
           # amd64: patch the packages Trivy flagged (single platform). Other
           # platforms: upgrade every package of that platform only.
           if [ "$PLATFORM" = linux/amd64 ]; then
