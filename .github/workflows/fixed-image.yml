@@ -1,0 +1,193 @@
+name: Fixed image
+
+# Rebuilds a public image with every OS package patched (Copacetic) and
+# publishes it on Docker Hub with the source tag:
+# itzg/minecraft-server:latest -> dockradar/itzg-minecraft-server:latest.
+# Started by DockRadar (requestFixedImage) through workflow_dispatch; progress
+# is posted back to the app's /api/fixed-images/callback with
+# FIXED_IMAGE_CALLBACK_SECRET.
+#
+# Setup (repository secrets): FIXED_IMAGE_CALLBACK_SECRET (same value as the
+# app's), FIXED_IMAGE_REGISTRY_USERNAME and FIXED_IMAGE_REGISTRY_TOKEN (a Docker
+# Hub access token with read/write on the namespace). Optional variable
+# FIXED_IMAGE_REPOSITORY: the namespace, "dockradar" by default; prefix it with
+# a host (registry.example.com/dockradar) to publish to another registry.
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: Public image to patch (e.g. itzg/minecraft-server:latest)
+        required: true
+      platform:
+        description: Platform to patch
+        required: true
+        default: linux/amd64
+      target:
+        description: Path and tag of the patched image below the fixed image repository
+        required: true
+      request_id:
+        description: DockRadar request id, echoed in the callbacks
+        required: true
+      callback_url:
+        description: DockRadar callback endpoint
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fixed-image-${{ inputs.target }}-${{ inputs.platform }}
+
+env:
+  COPA_VERSION: 0.11.1
+  BUILDKIT_IMAGE: moby/buildkit:v0.23.2
+  TRIVY_IMAGE: aquasec/trivy:0.76.1
+  # Inputs only reach the shell through the environment, never interpolated.
+  IMAGE: ${{ inputs.image }}
+  PLATFORM: ${{ inputs.platform }}
+  TARGET_PATH: ${{ inputs.target }}
+  REQUEST_ID: ${{ inputs.request_id }}
+  CALLBACK_URL: ${{ inputs.callback_url }}
+  CALLBACK_SECRET: ${{ secrets.FIXED_IMAGE_CALLBACK_SECRET }}
+  REGISTRY_USERNAME: ${{ secrets.FIXED_IMAGE_REGISTRY_USERNAME }}
+  REGISTRY_TOKEN: ${{ secrets.FIXED_IMAGE_REGISTRY_TOKEN }}
+  RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+jobs:
+  patch:
+    name: Patch ${{ inputs.image }} (${{ inputs.platform }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Validate inputs
+        run: |
+          set -eu
+          fail() { echo "$1" > "$RUNNER_TEMP/error.txt"; echo "::error::$1"; exit 1; }
+          echo "$IMAGE" | grep -Eq '^[a-z0-9][A-Za-z0-9._/:-]{0,250}$' || fail "Invalid image reference"
+          case "$PLATFORM" in linux/amd64|linux/arm64) ;; *) fail "Unsupported platform $PLATFORM" ;; esac
+          echo "$TARGET_PATH" | grep -Eq '^[a-z0-9][a-z0-9._/-]{0,250}:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$' \
+            || fail "Invalid target"
+          echo "$REQUEST_ID" | grep -Eq '^[0-9a-f]{48}$' || fail "Invalid request id"
+          echo "$CALLBACK_URL" | grep -Eq '^(https://[a-z0-9.-]+|http://localhost(:[0-9]+)?)/api/fixed-images/callback$' \
+            || fail "Invalid callback URL"
+          [ -n "$CALLBACK_SECRET" ] || fail "FIXED_IMAGE_CALLBACK_SECRET is not set"
+          [ -n "$REGISTRY_USERNAME" ] && [ -n "$REGISTRY_TOKEN" ] \
+            || fail "FIXED_IMAGE_REGISTRY_USERNAME / FIXED_IMAGE_REGISTRY_TOKEN are not set"
+          repository="${{ vars.FIXED_IMAGE_REPOSITORY }}"
+          [ -n "$repository" ] || repository="dockradar"
+          repository=$(echo "$repository" | tr '[:upper:]' '[:lower:]')
+          # A first component with a dot or a port is a registry host.
+          case "${repository%%/*}" in
+            *.*|*:*) echo "REGISTRY=${repository%%/*}" >> "$GITHUB_ENV" ;;
+            *) echo "REGISTRY=" >> "$GITHUB_ENV" ;;
+          esac
+          # A dated tag keeps each build reachable when the main tag moves on;
+          # tags are limited to 128 characters.
+          dated_tag="$(echo "${TARGET_PATH##*:}" | cut -c1-118)-$(date -u +%Y%m%d)"
+          echo "TARGET=$repository/$TARGET_PATH" >> "$GITHUB_ENV"
+          echo "DATED=$repository/${TARGET_PATH%:*}:$dated_tag" >> "$GITHUB_ENV"
+
+      - name: Report building
+        run: |
+          jq -n --arg id "$REQUEST_ID" --arg run "$RUN_URL" '{requestId: $id, status: "building", runUrl: $run}' \
+            | curl -fsS --retry 3 -X POST -H "Authorization: Bearer $CALLBACK_SECRET" \
+                -H "Content-Type: application/json" --data @- "$CALLBACK_URL" || true
+
+      - name: Set up QEMU
+        if: inputs.platform != 'linux/amd64'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Pull the original image
+        run: |
+          if ! docker pull --platform "$PLATFORM" "$IMAGE" 2> "$RUNNER_TEMP/pull.log"; then
+            cat "$RUNNER_TEMP/pull.log"
+            echo "Could not pull $IMAGE for $PLATFORM: only public images can be fixed" > "$RUNNER_TEMP/error.txt"
+            exit 1
+          fi
+
+      - name: Scan before
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$RUNNER_TEMP:/out" "$TRIVY_IMAGE" \
+            image --quiet --pkg-types os --ignore-unfixed --format json --output /out/before.json "$IMAGE"
+          echo "BEFORE=$(jq '[.Results[]?.Vulnerabilities[]?] | length' "$RUNNER_TEMP/before.json")" >> "$GITHUB_ENV"
+
+      - name: Install Copacetic
+        run: |
+          curl -fsSL "https://github.com/project-copacetic/copacetic/releases/download/v${COPA_VERSION}/copa_${COPA_VERSION}_linux_amd64.tar.gz" \
+            | tar -xz -C "$RUNNER_TEMP" copa
+          "$RUNNER_TEMP/copa" --version
+
+      - name: Start BuildKit
+        run: |
+          docker run --detach --rm --privileged -p 127.0.0.1:8888:8888/tcp --name buildkitd \
+            --entrypoint buildkitd "$BUILDKIT_IMAGE" --addr tcp://0.0.0.0:8888
+          for i in $(seq 30); do
+            docker exec buildkitd buildctl --addr tcp://127.0.0.1:8888 debug workers > /dev/null 2>&1 && exit 0
+            sleep 1
+          done
+          echo "BuildKit did not start" > "$RUNNER_TEMP/error.txt"
+          exit 1
+
+      - name: Patch every OS package
+        shell: bash
+        run: |
+          set -o pipefail
+          # Without a report, Copacetic upgrades every package of the image's
+          # package manager (apt, apk, dnf/yum, tdnf) to its latest version.
+          platform_flag=""
+          [ "$PLATFORM" = linux/amd64 ] || platform_flag="--platform $PLATFORM"
+          if ! "$RUNNER_TEMP/copa" patch --image "$IMAGE" --tag dockradar-patched $platform_flag \
+            --addr tcp://127.0.0.1:8888 --timeout 30m 2>&1 | tee "$RUNNER_TEMP/copa.log"; then
+            reason=$(grep -iE 'error|unsupported|no package manager' "$RUNNER_TEMP/copa.log" | tail -1 | cut -c1-300)
+            echo "Copacetic could not patch this image${reason:+: $reason}" > "$RUNNER_TEMP/error.txt"
+            exit 1
+          fi
+          # Copacetic loads the result as <repository>:dockradar-patched[-<arch>].
+          patched=$(docker images --format '{{.Repository}}:{{.Tag}}' | grep -m1 ':dockradar-patched' || true)
+          if [ -z "$patched" ]; then
+            echo "Copacetic produced no image (nothing to patch?)" > "$RUNNER_TEMP/error.txt"
+            exit 1
+          fi
+          docker tag "$patched" "$TARGET"
+          docker tag "$patched" "$DATED"
+
+      - name: Scan after
+        run: |
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$RUNNER_TEMP:/out" "$TRIVY_IMAGE" \
+            image --quiet --pkg-types os --ignore-unfixed --format json --output /out/after.json "$TARGET"
+          echo "AFTER=$(jq '[.Results[]?.Vulnerabilities[]?] | length' "$RUNNER_TEMP/after.json")" >> "$GITHUB_ENV"
+
+      - name: Log in to the registry
+        uses: docker/login-action@v3
+        with:
+          # Empty means Docker Hub.
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.FIXED_IMAGE_REGISTRY_USERNAME }}
+          password: ${{ secrets.FIXED_IMAGE_REGISTRY_TOKEN }}
+
+      - name: Publish
+        run: |
+          if ! docker push "$TARGET" || ! docker push "$DATED"; then
+            echo "Could not push the patched image to the registry" > "$RUNNER_TEMP/error.txt"
+            exit 1
+          fi
+          digest=$(docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$TARGET" | grep -m1 -o 'sha256:[0-9a-f]\{64\}')
+          echo "DIGEST=$digest" >> "$GITHUB_ENV"
+
+      - name: Report ready
+        run: |
+          jq -n --arg id "$REQUEST_ID" --arg run "$RUN_URL" --arg ref "$TARGET" --arg digest "$DIGEST" \
+            --argjson before "$BEFORE" --argjson after "$AFTER" \
+            '{requestId: $id, status: "ready", runUrl: $run, patchedRef: $ref, digest: $digest, vulnsBefore: $before, vulnsAfter: $after}' \
+            | curl -fsS --retry 3 -X POST -H "Authorization: Bearer $CALLBACK_SECRET" \
+                -H "Content-Type: application/json" --data @- "$CALLBACK_URL"
+
+      - name: Report failure
+        if: failure()
+        run: |
+          error=$(cat "$RUNNER_TEMP/error.txt" 2>/dev/null || echo "The build failed, see the build log")
+          jq -n --arg id "$REQUEST_ID" --arg run "$RUN_URL" --arg error "$error" \
+            '{requestId: $id, status: "failed", runUrl: $run, error: $error}' \
+            | curl -fsS --retry 3 -X POST -H "Authorization: Bearer $CALLBACK_SECRET" \
+                -H "Content-Type: application/json" --data @- "$CALLBACK_URL" || true
